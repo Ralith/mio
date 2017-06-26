@@ -42,7 +42,7 @@ struct Io {
 struct Inner {
     iocp: ReadyBinding,
     read: State<Vec<u8>, Vec<u8>>,
-    write: State<Vec<u8>, (Vec<u8>, usize)>,
+    write: State<Vec<u8>, ()>,  // Ready case is inused. TODO: use ! type
     read_buf: SocketAddrBuf,
 }
 
@@ -92,9 +92,14 @@ impl UdpSocket {
         let mut me = self.inner();
         let me = &mut *me;
 
-        match me.write {
+        match mem::replace(&mut me.write, State::Empty) {
             State::Empty => {}
-            _ => return Err(would_block()),
+            x@State::Pending(_) => {
+                me.write = x;
+                return Err(would_block());
+            }
+            State::Error(e) => return Err(e),
+            State::Ready(_) => unreachable!(),
         }
 
         if !me.iocp.registered() {
@@ -126,9 +131,14 @@ impl UdpSocket {
         let mut me = self.inner();
         let me = &mut *me;
 
-        match me.write {
+        match mem::replace(&mut me.write, State::Empty) {
             State::Empty => {}
-            _ => return Err(would_block()),
+            x@State::Pending(_) => {
+                me.write = x;
+                return Err(would_block());
+            }
+            State::Error(e) => return Err(e),
+            State::Ready(_) => unreachable!(),
         }
 
         if !me.iocp.registered() {
@@ -376,18 +386,22 @@ impl Drop for UdpSocket {
 
 fn send_done(status: &OVERLAPPED_ENTRY) {
     let status = CompletionStatus::from_entry(status);
-    trace!("finished a send {}", status.bytes_transferred());
     let me2 = Imp {
         inner: unsafe { overlapped2arc!(status.overlapped(), Io, write) },
     };
     let mut me = me2.inner();
-    me.write = State::Empty;
+    me.write = match unsafe { me2.inner.socket.result(status.overlapped()) } {
+        Err(e) => State::Error(e),
+        Ok((transferred, _)) => {
+            trace!("finished a send {}", transferred);
+            State::Empty
+        }
+    };
     me2.add_readiness(&mut me, Ready::writable());
 }
 
 fn recv_done(status: &OVERLAPPED_ENTRY) {
     let status = CompletionStatus::from_entry(status);
-    trace!("finished a recv {}", status.bytes_transferred());
     let me2 = Imp {
         inner: unsafe { overlapped2arc!(status.overlapped(), Io, read) },
     };
@@ -396,10 +410,16 @@ fn recv_done(status: &OVERLAPPED_ENTRY) {
         State::Pending(buf) => buf,
         _ => unreachable!(),
     };
-    unsafe {
-        buf.set_len(status.bytes_transferred() as usize);
-    }
-    me.read = State::Ready(buf);
+    me.read = match unsafe { me2.inner.socket.result(status.overlapped()) } {
+        Err(e) => State::Error(e),
+        Ok((transferred, _)) => {
+            trace!("finished a recv {}", transferred);
+            unsafe {
+                buf.set_len(transferred);
+            }
+            State::Ready(buf)
+        }
+    };
     me2.add_readiness(&mut me, Ready::readable());
 }
 
